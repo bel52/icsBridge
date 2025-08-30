@@ -6,7 +6,7 @@ echo "════════════════════════�
 
 # Check files exist
 echo "📁 Checking files..."
-for file in ~/icsBridge/ics_manager.sh ~/icsBridge/fetch_public_ics.py ~/icsBridge/outlook_create_events.applescript ~/icsBridge/outlook_remove_source.js; do
+for file in ~/icsBridge/ics_manager.sh ~/icsBridge/fetch_public_ics.py ~/icsBridge/outlook_create_events.js ~/icsBridge/outlook_remove_source.js; do
   if [[ -f "$file" ]]; then
     echo "  ✅ $(basename $file)"
   else
