@@ -80,6 +80,7 @@ list_sources() {
 }
 
 add_calendar() {
+  ensure_venv
   require_defaults_or_prompt
   load_config
 
@@ -94,16 +95,14 @@ add_calendar() {
   "$PY" "$ROOT_DIR/prepare_ics_for_import.py" "$SRC" "$ID" "$TMP_ICS"
 
   log "Opening Outlook import for: $TMP_ICS"
-  # Use Outlook's own importer; this was the known-good path on your Mac.
   open -a "Microsoft Outlook" "$TMP_ICS" || {
     echo "⚠️  Could not open Outlook with the ICS; try double-clicking $TMP_ICS manually."
   }
 
   echo
-  echo "➡ In the Outlook import window, choose: \"${CAL_NAME}\" (#${CAL_INDEX})."
+  echo "➡ In Outlook's import, choose: \"${CAL_NAME}\" (#${CAL_INDEX})."
   echo "   (Change defaults via menu option: Set Default Target Calendar)"
 
-  # Record tracking in both places
   echo "{\"id\":\"$ID\",\"url\":\"$SRC\",\"calendar\":\"$CAL_NAME\",\"index\":${CAL_INDEX}}" >> "$TRACK"
   echo "{\"id\":\"$ID\",\"url\":\"$SRC\",\"calendar\":\"$CAL_NAME\",\"index\":${CAL_INDEX}}" > "$MARK_DIR/${ID}.json"
 
@@ -112,6 +111,7 @@ add_calendar() {
 }
 
 remove_calendar() {
+  ensure_venv
   require_defaults_or_prompt
   load_config
 
@@ -136,9 +136,9 @@ remove_calendar() {
     LINE="$(sed -n "${N}p" "$TRACK" || true)"
     if [[ -z "$LINE" ]]; then echo "No such entry."; sleep 1; return; fi
 
-    ID="$(echo "$LINE" | sed -E 's/.*"id":"([^"]+)".*/\1/')"
-    CAL="$(echo "$LINE" | sed -E 's/.*"calendar":"([^"]+)".*/\1/')"
-    IDX="$(echo "$LINE" | sed -E 's/.*"index":([0-9]+).*/\1/')"
+    ID="$(echo "$LINE" | sed -E 's/.*\"id\":\"([^\"]+)\".*/\1/')"
+    CAL="$(echo "$LINE" | sed -E 's/.*\"calendar\":\"([^\"]+)\".*/\1/')"
+    IDX="$(echo "$LINE" | sed -E 's/.*\"index\":([0-9]+).*/\1/')"
 
     log "Deleting [SRC: $ID] from '$CAL' (#$IDX)…"
     osascript "$ROOT_DIR/outlook_delete_by_src.applescript" "$ID" "$CAL" "$IDX" \
@@ -151,8 +151,8 @@ remove_calendar() {
   else
     read -rp "Enter SRC ID to remove (e.g., lions): " ID
     if [[ -f "$MARK_DIR/${ID}.json" ]]; then
-      CAL="$(sed -E 's/.*"calendar":"([^"]+)".*/\1/;t;d' "$MARK_DIR/${ID}.json" || true)"
-      IDX="$(sed -E 's/.*"index":([0-9]+).*/\1/;t;d' "$MARK_DIR/${ID}.json" || true)"
+      CAL="$(sed -E 's/.*\"calendar\":\"([^\"]+)\".*/\1/;t;d' "$MARK_DIR/${ID}.json" || true)"
+      IDX="$(sed -E 's/.*\"index\":([0-9]+).*/\1/;t;d' "$MARK_DIR/${ID}.json" || true)"
       CAL="${CAL:-$CAL_NAME}"
       IDX="${IDX:-$CAL_INDEX}"
     else
@@ -184,7 +184,6 @@ MENU
 }
 
 main() {
-  ensure_venv
   while true; do
     menu
     case "${CHOICE:-}" in
