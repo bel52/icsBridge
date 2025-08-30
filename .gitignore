@@ -1,0 +1,22 @@
+# macOS clutter
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# Logs & runtime artifacts
+logs/
+sources.json
+*.log
+/tmp/
+*.tmp
+
+# Editor/IDE
+.vscode/
+.idea/
