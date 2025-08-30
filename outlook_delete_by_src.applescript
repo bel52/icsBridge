@@ -4,12 +4,7 @@ on run argv
   end if
   set srcID to item 1 of argv
   set calName to item 2 of argv
-  set idxText to item 3 of argv
-  try
-    set calIndex to (idxText as integer)
-  on error
-    error "INDEX must be a number"
-  end try
+  set calIndex to (item 3 of argv) as integer
 
   set tagText to "[SRC: " & srcID & "]"
   set deletedCount to 0
@@ -34,10 +29,9 @@ on run argv
     set evs to calendar events of targetCal
     repeat with e in evs
       set checkedCount to checkedCount + 1
+      set d to ""
       try
         set d to content of e
-      on error
-        set d to ""
       end try
       if (d contains tagText) then
         delete e
