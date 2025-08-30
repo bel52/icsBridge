@@ -1,98 +1,138 @@
-# icsBridge — Import public iCalendar (ICS) into Outlook (macOS)
+# icsBridge — v1.0
 
-Local-only tool to import public ICS/ICAL schedules (e.g., sports) into the **Outlook desktop app** on macOS.
-No Exchange/Graph calls — Outlook syncs them upstream like any event you created.
+A tiny toolchain to import public ICS calendars into **Outlook for Mac** with the **correct time** and a reliable way to **remove** those events later.
+
+---
 
 ## What it does
 
-* **Add**: Paste an `.ics`/`.ical` URL or file; events are created in your chosen Outlook calendar.
-* **List**: See tracked sources you’ve imported.
-* **Remove**: Delete all events imported for a given source (based on `[SRC: <id>]` tag in the notes).
+* **Normalizes** any ICS feed:
 
-Events are tagged in the notes with:
+  * Converts all *timed* events to **UTC** (`Z`) so Outlook shows the right local time (avoids double‑shift bugs).
+  * Removes calendar-level `X-WR-TIMEZONE` so Outlook doesn’t second-guess.
+  * Tags each event description with **`[SRC: <your-id>]`** for surgical removal later.
+  * Leaves **all-day** events untouched.
+* **Imports** via Outlook’s native ICS import dialog (stable/known‑good on macOS).
+* **Removes** previously imported events by scanning your chosen Outlook calendar and deleting any event whose description contains `[SRC: <your-id>]`.
+* **Persists defaults**: target Outlook **calendar name** and **occurrence index** are stored and reused so you’re not prompted every time.
 
-```
-[SRC: <your-source-id>]
-[ICSUID: <upstream-uid>]
-```
-
-## Repo layout
-
-```
-ics_manager.sh                     # interactive CLI (Add/Remove/List) + URL/file validation
-fetch_public_ics.py                # tiny ICS → JSON parser (no external deps)
-outlook_create_events.applescript  # creates events (AppleScript, most-compatible approach)
-outlook_remove_source.js           # removes events tagged with [SRC: ...]
-logs/                              # import logs (gitignored)
-sources.json                       # tracks sources (gitignored)
-```
+---
 
 ## Requirements
 
-* macOS with **Legacy Outlook** (Help → “Revert to Legacy Outlook”). New Outlook’s scripting is limited.
-* Allow your terminal app to control Outlook:
+* macOS with **Microsoft Outlook** (new Outlook works; tested on recent builds).
+* Python **3.9+** (uses stdlib `zoneinfo`).
+* Python packages (installed automatically into `.venv` on first run):
 
-  * **System Settings → Privacy & Security → Automation** → (Terminal/iTerm/VS Code) → **Microsoft Outlook**
-  * Sometimes also **Privacy & Security → Accessibility** → enable your terminal app.
+  * `icalendar`
+  * `python-dateutil`
 
-## Quick start
+---
+
+## Install / First Run
 
 ```bash
-cd ~/icsBridge
+git clone https://github.com/bel52/icsBridge.git
+cd icsBridge
 ./ics_manager.sh
-# 1) Add calendar
-#   - Paste an ICS URL (e.g. https://ics.calendarlabs.com/.../Detroit_Lions_Schedule.ics) or file path
-#   - Pick a short source ID (e.g. Lions_2025)
-#   - Calendar name: e.g. "Calendar" (or try a writable one like "Sports Imports")
-#   - Occurrence index: e.g. 2 for the second "Calendar"
+# Choose: 4) Set Default Target Calendar
+#   Name:  Calendar
+#   Index: 2
 ```
+
+---
+
+## Add a calendar
+
+```bash
+./ics_manager.sh
+# 1) Add Calendar via Outlook Import
+#   URL: <your ICS feed>
+#   ID:  <short id, e.g., lions>
+```
+
+* The tool normalizes the ICS to UTC and writes `/tmp/<id>.ics`.
+* Outlook’s import window opens. Select your default calendar (e.g., “Calendar” #2) and confirm.
+* The source is tracked in `.tracked_sources.json` **and** `.sources/<id>.json`.
+
+---
+
+## Remove a calendar’s events
+
+```bash
+./ics_manager.sh
+# 2) Remove Imported Calendar
+#   a) pick a tracked entry, or
+#   b) enter the SRC ID (even if not tracked)
+```
+
+Removal uses `outlook_delete_by_src.applescript` to delete events in your target calendar whose **description** contains `[SRC: <id>]`.
+
+---
+
+## Why UTC?
+
+Outlook for Mac can misinterpret combos of `X-WR-TIMEZONE`, property `TZID`, and local settings, causing off-by-hours. Writing *timed* events in **UTC** is the most reliable path—Outlook renders them correctly in your local zone.
+
+---
 
 ## Troubleshooting
 
-### “A privilege violation occurred. (-10004)”
+* **See what’s happening**: `ics_manager.sh` prints verbose steps; no screen clearing.
+* **Sanity-check a normalized ICS**:
 
-macOS privacy is blocking writes to Outlook. Fix:
+  * It should have **no `X-WR-TIMEZONE`**.
+  * `DTSTART`/`DTEND` should end with **`Z`** (UTC).
+* **Still wrong times?**
 
-1. Use **Legacy Outlook**.
-2. System Settings → Privacy & Security → **Automation** → enable your terminal app for **Microsoft Outlook**.
-3. (Sometimes) also enable your terminal app in **Accessibility**.
-4. Quit/relaunch Outlook and your terminal app.
+  * Re-remove and re-import.
+  * Make sure you’re importing the freshly normalized `/tmp/<id>.ics`.
 
-Sanity test (creates a 1-hour “Test” event in your default calendar):
+---
 
-```applescript
-tell application "Microsoft Outlook"
-  make new calendar event with properties {subject:"Test via Terminal", start time:(current date), end time:(current date) + 3600}
-end tell
-```
+## Security note
 
-### “A property can’t go after this identifier. (-2740)” / “Expected ':' but found property. (-2741)”
+`prepare_ics_for_import.py` fetches feeds over HTTPS and currently uses an **unverified SSL context** for compatibility with some ICS hosts. For stricter security, switch to the default verified context or pin hosts—easy tweak.
 
-These are strict AppleScript parser quirks. The included `outlook_create_events.applescript` avoids line continuations and sets properties in simple, compatible statements.
+---
 
-### Target calendar might be read-only
+## What’s in v1.0
 
-Some calendars (shared/subscribed) don’t allow scripted writes. If writes fail only for a specific calendar:
+* **Stable import path** (Outlook’s native importer).
+* **UTC-normalized ICS** to avoid tz confusion.
+* **One-shot removal** by `[SRC: id]`.
+* **Persistent defaults** for calendar name/index.
+* Leaned repo (removed legacy/unneeded scripts).
 
-* Try creating a local calendar (once):
+---
 
-  ```applescript
-  tell application "Microsoft Outlook"
-    if (count of (calendars whose name is "Sports Imports")) = 0 then
-      make new calendar with properties {name:"Sports Imports"}
-    end if
-  end tell
-  ```
-* Then import into **"Sports Imports"** (occurrence index `1`).
+## Repo Layout (v1.0)
 
-## Remove imported events
+* `ics_manager.sh` — menu tool; normalize → open Outlook importer; removal by tag; persistent defaults.
+* `prepare_ics_for_import.py` — fetch + normalize ICS to UTC; tag descriptions.
+* `outlook_delete_by_src.applescript` — delete by `[SRC: <id>]` in chosen calendar.
+* `.icsbridge_config` — stored defaults (calendar name + index).
+* `.tracked_sources.json` — newline-JSON tracker (append-only log).
+* `.sources/` — per-source markers (redundant/handy for recovery).
+* `requirements.txt` — Python deps (venv installs automatically).
+* `VERSION` — current version string (e.g., `1.0.0`).
 
-Use the menu → **Remove** → choose your `sourceId`.
-Only events tagged with `[SRC: <sourceId>]` are removed.
+---
 
-## Notes
+## Changelog
 
-* `.ics` and `.ical` are both accepted (same iCalendar format).
-* The importer writes a JSON temp file to `/tmp/<source>_events.json`.
-* If you modify the AppleScript or JXA files, re-run the manager — no rebuild needed.
+### 1.0.0
 
+* Normalize all timed events to UTC; strip `X-WR-TIMEZONE`.
+* Persist target calendar name + index.
+* Stable import via Outlook dialog (no JXA writes).
+* Robust removal by `[SRC: <id>]`.
+* Cleaned up legacy scripts.
+
+---
+
+## License
+
+(Choose one appropriate for your project; e.g., MIT.)
+
+EOF
