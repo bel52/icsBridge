@@ -1,2 +1,2 @@
-icalendar
-pytz
+icalendar>=6.0
+python-dateutil>=2.8
