@@ -39,9 +39,6 @@ on run argv
         try set noteText to the content of plain text content of ev end try
 
         set hit to false
-        considering case
-          -- do nothing, default is case-sensitive
-        end considering
         ignoring case
           if (subj contains needle) or (orgz contains needle) or (noteText contains needle) then set hit to true
         end ignoring
@@ -54,7 +51,7 @@ on run argv
           end try
 
           if catName is "" then
-            -- clear
+            -- clear category
             try
               set category of ev to ""
               set matchedCount to matchedCount + 1
@@ -66,7 +63,6 @@ on run argv
                 set matchedCount to matchedCount + 1
               end try
             else
-              -- append if not already present (simple comma-space list)
               ignoring case
                 if curCat does not contain catName then
                   try
