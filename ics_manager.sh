@@ -1,127 +1,200 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON="$HOME/icsBridge/.venv/bin/python3"
-SOURCES_FILE="$HOME/icsBridge/sources.json"
-LOG_DIR="$HOME/icsBridge/logs"
+# ====== Settings ======
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_BIN="$ROOT_DIR/.venv/bin"
+PY="$VENV_BIN/python3"
 
-mkdir -p "$(dirname "$SOURCES_FILE")" "$LOG_DIR"
-if [[ ! -f "$SOURCES_FILE" ]]; then echo '{}' > "$SOURCES_FILE"; fi
+CONF_FILE="$ROOT_DIR/.icsbridge_config"   # stores CAL_NAME & CAL_INDEX
+TRACK="$ROOT_DIR/.tracked_sources.json"   # newline-delimited JSON entries
+MARK_DIR="$ROOT_DIR/.sources"             # per-source marker files (redundant, helpful)
 
-# ===== JSON helpers =====
-json_keys() { "$PYTHON" -c 'import json,sys; [print(k) for k in sorted(json.load(open(sys.argv[1])).keys())]' "$SOURCES_FILE"; }
-json_get_field() { "$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], {}).get(sys.argv[3], ""))' "$SOURCES_FILE" "$1" "$2"; }
-json_add_or_update() {
-  local key="$1" src="$2" cal="$3" idx="$4"
-  "$PYTHON" -c 'import json,sys; p,key,src,cal,idx=sys.argv[1:6]; d=json.load(open(p)); d[key]={"source":src,"calendar":cal,"calendar_index":int(idx)}; json.dump(d,open(p,"w"),indent=2)' "$SOURCES_FILE" "$key" "$src" "$cal" "$idx"
-}
-json_delete_key() { "$PYTHON" -c 'import json,sys; p,key=sys.argv[1:3]; d=json.load(open(p)); d.pop(key, None); json.dump(d,open(p,"w"),indent=2)' "$SOURCES_FILE" "$1"; }
+# UI behavior (no auto-clear; always verbose)
+: "${ICSBRIDGE_VERBOSE:=1}"
 
-# List tracked sources
-list_sources() {
-  local keys; keys="$(json_keys)"
-  if [[ -z "${keys:-}" ]]; then echo "No tracked calendars yet."; return; fi
-  echo "═════════ Tracked Sources ═════════"
-  local i=1
-  while IFS= read -r k; do
-    [[ -z "$k" ]] && continue
-    echo "$i) ID: $k"
-    echo "   Source: $(json_get_field "$k" "source")"
-    echo "   Target Calendar: \"$(json_get_field "$k" "calendar")\" (#$(json_get_field "$k" "calendar_index"))"
-    echo "───────────────────────────────────"
-    i=$((i+1))
-  done <<< "$keys"
-}
+mkdir -p "$MARK_DIR"
+touch "$TRACK"
 
-# Add/Update calendar
-add_calendar() {
-  echo; echo "═════════ Add Calendar Source ═════════"
-  printf "Enter calendar source (URL): "
-  read SOURCE
-  if [[ -z "${SOURCE:-}" ]]; then echo "❌ No source provided."; return; fi
-  
-  printf "Enter a short ID for this calendar (e.g., lions-2025): "
-  read SRC_ID
-  if [[ -z "${SRC_ID:-}" ]]; then echo "❌ No ID provided."; return; fi
-  
-  printf "Enter target Outlook calendar name (for tracking): "
-  read CAL_NAME
-  if [[ -z "${CAL_NAME:-}" ]]; then echo "❌ No calendar name provided."; return; fi
+ts() { date "+%Y-%m-%d %H:%M:%S"; }
+log() { if [[ "${ICSBRIDGE_VERBOSE}" = "1" ]]; then echo "[$(ts)] $*"; fi; }
 
-  printf "Enter occurrence index for that name [2]: "
-  read CAL_INDEX
-  CAL_INDEX=${CAL_INDEX:-2}
-
-  local ics_out="/tmp/${SRC_ID}.ics"
-  
-  echo; echo "🔄 Preparing tagged ICS file..."
-  
-  set +e
-  local result
-  result=$("$PYTHON" "$HOME/icsBridge/prepare_ics_for_import.py" "$SOURCE" "$SRC_ID" "$ics_out" 2>&1)
-  local py_rc=$?
-  set -e
-  echo "$result"
-
-  if [[ $py_rc -ne 0 ]]; then echo "❌ Failed to process calendar."; return; fi
-  
-  json_add_or_update "$SRC_ID" "$SOURCE" "$CAL_NAME" "$CAL_INDEX"
-  
-  echo; echo "✅ ICS file is ready. Outlook's import dialog will now open."
-  echo "Please select the calendar \"$CAL_NAME\" (#$CAL_INDEX) in the dialog."
-  
-  open -a "Microsoft Outlook" "$ics_out"
-  echo; echo "✨ Import process initiated."
-}
-
-# Remove calendar events
-remove_calendar() {
-  echo; echo "════════ Remove Calendar Events ════════"
-  local keys; keys="$(json_keys)"
-  if [[ -z "${keys:-}" ]]; then echo "No tracked calendars to remove."; return; fi
-  
-  local arr=(); while IFS= read -r k; do [[ -z "$k" ]] || arr+=("$k"); done <<< "$keys"
-  list_sources
-  printf "Enter number to remove (or 'q' to cancel): "; read choice
-  if [[ "$choice" =~ ^[Qq]$ ]] || [[ -z "$choice" ]]; then echo "Cancelled."; return; fi
-  
-  local chosen_id="${arr[$((choice-1))]}"
-  local cal_name="$(json_get_field "$chosen_id" "calendar")"
-  local cal_idx="$(json_get_field "$chosen_id" "calendar_index")"
-  
-  echo; echo "🗑️  Removing events for '$chosen_id' from \"$cal_name\" (#$cal_idx)..."
-  
-  local result
-  result=$(osascript -l JavaScript "$HOME/icsBridge/outlook_remove_source.js" "$cal_name" "$cal_idx" "$chosen_id" 2>&1 || true)
-  echo "$result"
-  
-  if echo "$result" | grep -q '"ok":true'; then
-    json_delete_key "$chosen_id"
-    echo "✅ Removed '$chosen_id' from tracking."
-  else
-    echo "⚠️  Removal failed or no events were found with that tag."
+ensure_venv() {
+  if [[ ! -x "$PY" ]]; then
+    log "Creating venv at $VENV_BIN and installing deps…"
+    python3 -m venv "$ROOT_DIR/.venv"
+    "$PY" -m pip install --upgrade pip >/dev/null
+    "$PY" -m pip install icalendar python-dateutil >/dev/null
   fi
 }
 
-# Main menu
-main_menu() {
-  while true; do
+load_config() {
+  CAL_NAME=""
+  CAL_INDEX=""
+  if [[ -f "$CONF_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF_FILE" || true
+  fi
+}
+
+save_config() {
+  local name="$1"
+  local index="$2"
+  cat > "$CONF_FILE" <<CFG
+CAL_NAME='${name//\'/\'\\\'\'}'
+CAL_INDEX='${index//\'/\'\\\'\'}'
+CFG
+  log "Saved defaults: calendar='${name}', index=${index}"
+}
+
+require_defaults_or_prompt() {
+  load_config
+  if [[ -z "${CAL_NAME:-}" || -z "${CAL_INDEX:-}" ]]; then
     echo
-    echo "╔═════════ ICS Bridge for Outlook ═════════╗"
-    echo "║ 1) ➕ Add Calendar via Outlook Import    ║"
-    echo "║ 2) 🗑️  Remove Imported Calendar         ║"
-    echo "║ 3) 📋 List Imported Calendars          ║"
-    echo "║ 4) ❌ Quit                               ║"
-    echo "╚══════════════════════════════════════════╝"
-    printf "Choose [1-4]: "; read opt
-    case "$opt" in
+    read -rp "Enter target Outlook calendar name (e.g., Calendar): " CAL_NAME
+    read -rp "Enter occurrence index for that name (e.g., 2): " CAL_INDEX
+    CAL_INDEX="${CAL_INDEX:-2}"
+    save_config "$CAL_NAME" "$CAL_INDEX"
+  fi
+}
+
+set_defaults() {
+  load_config
+  echo
+  echo "════════ Set Default Target Calendar ════════"
+  echo "Current: calendar='${CAL_NAME:-<unset>}', index='${CAL_INDEX:-<unset>}'"
+  read -rp "New target Outlook calendar name: " NEW_NAME
+  read -rp "New occurrence index (number): " NEW_IDX
+  NEW_IDX="${NEW_IDX:-2}"
+  save_config "$NEW_NAME" "$NEW_IDX"
+  read -rp "Press Enter to continue…" _
+}
+
+list_sources() {
+  echo "═════════ Tracked Sources (file) ═════════"
+  if [[ -s "$TRACK" ]]; then nl -ba "$TRACK"; else echo "(none)"; fi
+  echo "───────────────────────────────────────────"
+  echo "═════════ Tracked Sources (.sources) ═════"
+  ls -1 "$MARK_DIR" 2>/dev/null | sed 's/.json$//' || echo "(none)"
+  echo "───────────────────────────────────────────"
+}
+
+add_calendar() {
+  ensure_venv
+  require_defaults_or_prompt
+  load_config
+
+  echo
+  read -rp "Enter calendar source (URL): " SRC
+  read -rp "Enter a short ID for this calendar (e.g., lions-2025): " ID
+
+  TMP_ICS="/tmp/${ID}.ics"
+
+  log "Preparing ICS…"
+  log "Fetch & normalize: $SRC  ->  $TMP_ICS"
+  "$PY" "$ROOT_DIR/prepare_ics_for_import.py" "$SRC" "$ID" "$TMP_ICS"
+
+  log "Opening Outlook import for: $TMP_ICS"
+  open -a "Microsoft Outlook" "$TMP_ICS" || {
+    echo "⚠️  Could not open Outlook with the ICS; try double-clicking $TMP_ICS manually."
+  }
+
+  echo
+  echo "➡ In Outlook's import, choose: \"${CAL_NAME}\" (#${CAL_INDEX})."
+  echo "   (Change defaults via menu option: Set Default Target Calendar)"
+
+  echo "{\"id\":\"$ID\",\"url\":\"$SRC\",\"calendar\":\"$CAL_NAME\",\"index\":${CAL_INDEX}}" >> "$TRACK"
+  echo "{\"id\":\"$ID\",\"url\":\"$SRC\",\"calendar\":\"$CAL_NAME\",\"index\":${CAL_INDEX}}" > "$MARK_DIR/${ID}.json"
+
+  log "Done. Imported '$ID' (pending your confirmation in Outlook)."
+  read -rp "Press Enter to continue…" _
+}
+
+remove_calendar() {
+  ensure_venv
+  require_defaults_or_prompt
+  load_config
+
+  echo "════════ Remove Calendar Events ════════"
+  list_sources
+  echo
+  echo "Options:"
+  echo "  a) Remove by choosing a tracked entry"
+  echo "  b) Remove by entering an SRC ID manually (even if not tracked)"
+  read -rp "Choose [a/b] (default a): " MODE
+  MODE="${MODE:-a}"
+
+  if [[ "$MODE" == "a" && ! -s "$TRACK" ]]; then
+    echo "(No file-tracked entries. Switching to manual SRC ID.)"
+    MODE="b"
+  fi
+
+  local ID CAL IDX
+  if [[ "$MODE" == "a" ]]; then
+    read -rp "Enter number to remove (or 'q' to cancel): " N
+    [[ "$N" =~ ^[0-9]+$ ]] || { echo "Cancelled."; sleep 1; return; }
+    LINE="$(sed -n "${N}p" "$TRACK" || true)"
+    if [[ -z "$LINE" ]]; then echo "No such entry."; sleep 1; return; fi
+
+    ID="$(echo "$LINE" | sed -E 's/.*\"id\":\"([^\"]+)\".*/\1/')"
+    CAL="$(echo "$LINE" | sed -E 's/.*\"calendar\":\"([^\"]+)\".*/\1/')"
+    IDX="$(echo "$LINE" | sed -E 's/.*\"index\":([0-9]+).*/\1/')"
+
+    log "Deleting [SRC: $ID] from '$CAL' (#$IDX)…"
+    osascript "$ROOT_DIR/outlook_delete_by_src.applescript" "$ID" "$CAL" "$IDX" \
+      && log "Deleted events tagged [SRC: $ID]" \
+      || echo "⚠️  Delete script reported an error."
+
+    tmpf="$(mktemp)"; awk -v n="$N" 'NR!=n' "$TRACK" > "$tmpf" && mv "$tmpf" "$TRACK"
+    rm -f "$MARK_DIR/${ID}.json"
+    read -rp "Press Enter to continue…" _
+  else
+    read -rp "Enter SRC ID to remove (e.g., lions): " ID
+    if [[ -f "$MARK_DIR/${ID}.json" ]]; then
+      CAL="$(sed -E 's/.*\"calendar\":\"([^\"]+)\".*/\1/;t;d' "$MARK_DIR/${ID}.json" || true)"
+      IDX="$(sed -E 's/.*\"index\":([0-9]+).*/\1/;t;d' "$MARK_DIR/${ID}.json" || true)"
+      CAL="${CAL:-$CAL_NAME}"
+      IDX="${IDX:-$CAL_INDEX}"
+    else
+      CAL="$CAL_NAME"
+      IDX="$CAL_INDEX"
+    fi
+    log "Deleting [SRC: $ID] from '$CAL' (#$IDX)…"
+    osascript "$ROOT_DIR/outlook_delete_by_src.applescript" "$ID" "$CAL" "$IDX" \
+      && log "Deleted events tagged [SRC: $ID]" \
+      || echo "⚠️  Delete script reported an error."
+
+    tmpf="$(mktemp)"; grep -v "\"id\":\"$ID\"" "$TRACK" > "$tmpf" || true; mv "$tmpf" "$TRACK"
+    rm -f "$MARK_DIR/${ID}.json"
+    read -rp "Press Enter to continue…" _
+  fi
+}
+
+menu() {
+  cat <<MENU
+╔═════════ ICS Bridge for Outlook ═════════╗
+║ 1) ➕ Add Calendar via Outlook Import    ║
+║ 2) 🗑️  Remove Imported Calendar         ║
+║ 3) 📋 List Imported Calendars           ║
+║ 4) 🛠️  Set Default Target Calendar      ║
+║ 5) ❌ Quit                               ║
+╚══════════════════════════════════════════╝
+MENU
+  read -rp "Choose [1-5]: " CHOICE
+}
+
+main() {
+  while true; do
+    menu
+    case "${CHOICE:-}" in
       1) add_calendar ;;
       2) remove_calendar ;;
-      3) echo; list_sources ;;
-      4) echo "👋 Goodbye!"; exit 0 ;;
-      *) echo "Invalid option." ;;
+      3) list_sources; read -rp "Press Enter to continue…" _ ;;
+      4) set_defaults ;;
+      5) exit 0 ;;
+      *) echo "Invalid choice"; sleep 1 ;;
     esac
   done
 }
 
-main_menu
+main "$@"
