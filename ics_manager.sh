@@ -16,7 +16,6 @@ TRACK_LOCAL="${ROOT_DIR}/.tracked_sources.json"
 MARK_LOCAL="${ROOT_DIR}/.sources"
 
 CONF_FILE="${ROOT_DIR}/.icsbridge_config"  # defaults: CAL_NAME, CAL_INDEX
-
 : "${ICSBRIDGE_VERBOSE:=1}"
 
 mkdir -p "${PERSIST_DIR}" "${P_MARK_DIR}" "${MARK_LOCAL}"
@@ -62,21 +61,29 @@ upsert_track(){
   local line="{\"id\":\"$id\",\"url\":\"$url\",\"calendar\":\"$cal\",\"index\":${idx}}"
 
   # persistent
-  tmp="$(mktemp)"; grep -v "\"id\":\"$id\"" "$P_TRACK" > "$tmp" || true; mv "$tmp" "$P_TRACK"
+  local tmp; tmp="$(mktemp)"
+  grep -v "\"id\":\"$id\"" "$P_TRACK" > "$tmp" || true
+  mv "$tmp" "$P_TRACK"
   echo "$line" >> "$P_TRACK"
   echo "$line" > "$P_MARK_DIR/${id}.json"
 
-  # local (for older scripts you may still have lying around)
-  tmp="$(mktemp)"; grep -v "\"id\":\"$id\"" "$TRACK_LOCAL" > "$tmp" || true; mv "$tmp" "$TRACK_LOCAL"
+  # local
+  tmp="$(mktemp)"
+  grep -v "\"id\":\"$id\"" "$TRACK_LOCAL" > "$tmp" || true
+  mv "$tmp" "$TRACK_LOCAL"
   echo "$line" >> "$TRACK_LOCAL"
   echo "$line" > "$MARK_LOCAL/${id}.json"
 }
 
 delete_track(){
   local id="$1"
-  tmp="$(mktemp)"; grep -v "\"id\":\"$id\"" "$P_TRACK" > "$tmp" || true; mv "$tmp" "$P_TRACK"
+  local tmp; tmp="$(mktemp)"
+  grep -v "\"id\":\"$id\"" "$P_TRACK" > "$tmp" || true
+  mv "$tmp" "$P_TRACK"
   rm -f "$P_MARK_DIR/${id}.json"
-  tmp="$(mktemp)"; grep -v "\"id\":\"$id\"" "$TRACK_LOCAL" > "$tmp" || true; mv "$tmp" "$TRACK_LOCAL"
+  tmp="$(mktemp)"
+  grep -v "\"id\":\"$id\"" "$TRACK_LOCAL" > "$tmp" || true
+  mv "$tmp" "$TRACK_LOCAL"
   rm -f "$MARK_LOCAL/${id}.json"
 }
 
@@ -145,16 +152,14 @@ add_calendar_url(){
   read -rp "Press Enter to continue…" _
 }
 
-import_local_file(){
+import_local_file() {
   ensure_venv
   require_defaults_or_prompt
   load_config
   echo
   read -rp "Enter FULL path to .ics file: " FP
-  ABS="$("$PY" - <<PY
-import os,sys; p=sys.argv[1]; print(os.path.abspath(os.path.expanduser(p)))
-PY
-"$FP")"
+  # Resolve the absolute path safely
+  ABS="$("$PY" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$FP")"
   if [[ ! -f "$ABS" ]]; then
     echo "❌ File not found: $ABS"; read -rp "Press Enter…" _; return
   fi
@@ -205,10 +210,30 @@ rebuild_tracking(){
   echo "Scanning \"$CAL_NAME\" (#$CAL_INDEX) for [SRC: …] tags…"
   json="$(osascript "$ROOT_DIR/outlook_scan_srcs.applescript" "$CAL_NAME" "$CAL_INDEX" || true)"
   echo "$json" | grep -q '"sources"' || { echo "⚠️  No data returned."; read -rp "Enter…" _; return; }
-  echo "$json" | sed -n 's/.*"id":"\([^"]\+\)".*"count":\([0-9]\+\).*/\1 \2/p' | while read -r ID CNT; do
+
+  # Parse JSON via Python (command substitution), then loop safely.
+  ids_and_counts="$(
+    printf "%s" "$json" | "$PY" - <<'PY'
+import sys, json
+txt=sys.stdin.read()
+try:
+  data=json.loads(txt)
+  for s in data.get("sources", []):
+    i=s.get("id")
+    c=s.get("count",0)
+    if i:
+      print(f"{i}\t{c}")
+except Exception:
+  pass
+PY
+  )"
+
+  while IFS=$'\t' read -r ID CNT; do
+    [[ -z "${ID:-}" ]] && continue
     upsert_track "$ID" "" "$CAL_NAME" "$CAL_INDEX"
     echo "  • Rebuilt: $ID (events: $CNT)"
-  done
+  done <<< "$ids_and_counts"
+
   echo "✅ Rebuild complete. (Persistent file: ${P_TRACK})"
   read -rp "Press Enter to continue…" _
 }
