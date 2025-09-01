@@ -21,3 +21,6 @@ sources.json
 .vscode/
 .idea/
 .icsbridge
+.icsbridge_config
+.sources/
+.tracked_sources.json
