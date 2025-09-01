@@ -1,197 +1,269 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ====== Settings ======
+# ===== Paths =====
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_BIN="$ROOT_DIR/.venv/bin"
 PY="$VENV_BIN/python3"
 
-CONF_FILE="$ROOT_DIR/.icsbridge_config"   # stores CAL_NAME & CAL_INDEX
-TRACK="$ROOT_DIR/.tracked_sources.json"   # newline-delimited JSON entries
-MARK_DIR="$ROOT_DIR/.sources"             # per-source marker files (redundant, helpful)
+# Persistent tracker (outside the repo) — survives codebase changes
+PERSIST_DIR="${HOME}/.icsbridge"
+P_TRACK="${PERSIST_DIR}/tracked.jsonl"     # JSON Lines: {"id":"...","url":"...","calendar":"...","index":N}
+P_MARK_DIR="${PERSIST_DIR}/sources"        # per-source mirrors (optional)
 
-# UI behavior (no auto-clear; always verbose)
+# Back-compat (in-repo) — kept so older entries still show up
+TRACK_LOCAL="${ROOT_DIR}/.tracked_sources.json"
+MARK_LOCAL="${ROOT_DIR}/.sources"
+
+CONF_FILE="${ROOT_DIR}/.icsbridge_config"  # defaults: CAL_NAME, CAL_INDEX
 : "${ICSBRIDGE_VERBOSE:=1}"
 
-mkdir -p "$MARK_DIR"
-touch "$TRACK"
+mkdir -p "${PERSIST_DIR}" "${P_MARK_DIR}" "${MARK_LOCAL}"
+touch "${P_TRACK}" "${TRACK_LOCAL}"
 
-ts() { date "+%Y-%m-%d %H:%M:%S"; }
-log() { if [[ "${ICSBRIDGE_VERBOSE}" = "1" ]]; then echo "[$(ts)] $*"; fi; }
+ts(){ date "+%Y-%m-%d %H:%M:%S"; }
+log(){ [[ "$ICSBRIDGE_VERBOSE" = "1" ]] && echo "[$(ts)] $*"; }
 
-ensure_venv() {
+ensure_venv(){
   if [[ ! -x "$PY" ]]; then
-    log "Creating venv at $VENV_BIN and installing deps…"
+    log "Creating venv and installing deps…"
     python3 -m venv "$ROOT_DIR/.venv"
     "$PY" -m pip install --upgrade pip >/dev/null
     "$PY" -m pip install icalendar python-dateutil >/dev/null
   fi
 }
 
-load_config() {
-  CAL_NAME=""
-  CAL_INDEX=""
-  if [[ -f "$CONF_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONF_FILE" || true
-  fi
-}
+load_config(){ CAL_NAME=""; CAL_INDEX="";
+  [[ -f "$CONF_FILE" ]] && source "$CONF_FILE" || true; }
 
-save_config() {
-  local name="$1"
-  local index="$2"
-  cat > "$CONF_FILE" <<CFG
-CAL_NAME='${name//\'/\'\\\'\'}'
-CAL_INDEX='${index//\'/\'\\\'\'}'
-CFG
-  log "Saved defaults: calendar='${name}', index=${index}"
-}
+save_config(){ printf "CAL_NAME='%s'\nCAL_INDEX='%s'\n" "$1" "$2" > "$CONF_FILE"; log "Saved defaults: $1 #$2"; }
 
-require_defaults_or_prompt() {
+require_defaults_or_prompt(){
   load_config
   if [[ -z "${CAL_NAME:-}" || -z "${CAL_INDEX:-}" ]]; then
     echo
     read -rp "Enter target Outlook calendar name (e.g., Calendar): " CAL_NAME
     read -rp "Enter occurrence index for that name (e.g., 2): " CAL_INDEX
-    CAL_INDEX="${CAL_INDEX:-2}"
-    save_config "$CAL_NAME" "$CAL_INDEX"
+    CAL_INDEX="${CAL_INDEX:-2}"; save_config "$CAL_NAME" "$CAL_INDEX"
+  fi
+  # guard: mis-set names (URLs) silently break later steps
+  if [[ "${CAL_NAME}" == *"://"* ]]; then
+    echo "⚠️  Saved calendar looks like a URL (${CAL_NAME}). Resetting…"
+    read -rp "Enter target Outlook calendar name (e.g., Calendar): " CAL_NAME
+    read -rp "Enter occurrence index for that name (e.g., 2): " CAL_INDEX
+    CAL_INDEX="${CAL_INDEX:-2}"; save_config "$CAL_NAME" "$CAL_INDEX"
   fi
 }
 
-set_defaults() {
+# ---- Tracking helpers (write to persistent AND local for back-compat) ----
+upsert_track(){
+  local id="$1" url="$2" cal="$3" idx="$4"
+  local line="{\"id\":\"$id\",\"url\":\"$url\",\"calendar\":\"$cal\",\"index\":${idx}}"
+
+  # persistent
+  local tmp; tmp="$(mktemp)"
+  grep -v "\"id\":\"$id\"" "$P_TRACK" > "$tmp" || true
+  mv "$tmp" "$P_TRACK"
+  echo "$line" >> "$P_TRACK"
+  echo "$line" > "$P_MARK_DIR/${id}.json"
+
+  # local
+  tmp="$(mktemp)"
+  grep -v "\"id\":\"$id\"" "$TRACK_LOCAL" > "$tmp" || true
+  mv "$tmp" "$TRACK_LOCAL"
+  echo "$line" >> "$TRACK_LOCAL"
+  echo "$line" > "$MARK_LOCAL/${id}.json"
+}
+
+delete_track(){
+  local id="$1"
+  local tmp; tmp="$(mktemp)"
+  grep -v "\"id\":\"$id\"" "$P_TRACK" > "$tmp" || true
+  mv "$tmp" "$P_TRACK"
+  rm -f "$P_MARK_DIR/${id}.json"
+  tmp="$(mktemp)"
+  grep -v "\"id\":\"$id\"" "$TRACK_LOCAL" > "$tmp" || true
+  mv "$tmp" "$TRACK_LOCAL"
+  rm -f "$MARK_LOCAL/${id}.json"
+}
+
+get_all_ids(){
+  { sed -n 's/.*"id":"\([^"]\+\)".*/\1/p' "$P_TRACK"
+    sed -n 's/.*"id":"\([^"]\+\)".*/\1/p' "$TRACK_LOCAL"
+    (ls -1 "$P_MARK_DIR" 2>/dev/null || true) | sed 's/\.json$//'
+    (ls -1 "$MARK_LOCAL" 2>/dev/null || true) | sed 's/\.json$//'
+  } | sort -u
+}
+
+set_defaults(){
   load_config
-  echo
-  echo "════════ Set Default Target Calendar ════════"
-  echo "Current: calendar='${CAL_NAME:-<unset>}', index='${CAL_INDEX:-<unset>}'"
-  read -rp "New target Outlook calendar name: " NEW_NAME
-  read -rp "New occurrence index (number): " NEW_IDX
-  NEW_IDX="${NEW_IDX:-2}"
-  save_config "$NEW_NAME" "$NEW_IDX"
+  echo "Current: '${CAL_NAME:-<unset>}' #${CAL_INDEX:-<unset>}"
+  read -rp "New calendar name: " n
+  read -rp "New index (number): " i
+  i="${i:-2}"
+  save_config "$n" "$i"
   read -rp "Press Enter to continue…" _
 }
 
-list_sources() {
-  echo "═════════ Tracked Sources (file) ═════════"
-  if [[ -s "$TRACK" ]]; then nl -ba "$TRACK"; else echo "(none)"; fi
-  echo "───────────────────────────────────────────"
-  echo "═════════ Tracked Sources (.sources) ═════"
-  ls -1 "$MARK_DIR" 2>/dev/null | sed 's/.json$//' || echo "(none)"
-  echo "───────────────────────────────────────────"
+list_sources(){
+  require_defaults_or_prompt
+  echo "═════════ Tracked Calendars (persistent + local) ═════════"
+  ids="$(get_all_ids)"
+  if [[ -z "$ids" ]]; then
+    echo "(none)"; echo "────────────────────────────────────────────"; return
+  fi
+  printf "%-16s %-10s %-20s %s\n" "ID" "Index" "Calendar" "URL"
+  printf "%-16s %-10s %-20s %s\n" "--" "-----" "--------" "---"
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    # prefer persistent; fall back to local; then to defaults
+    line="$(grep "\"id\":\"$id\"" "$P_TRACK" | tail -1)"
+    [[ -z "$line" ]] && line="$(grep "\"id\":\"$id\"" "$TRACK_LOCAL" | tail -1)"
+    url="$(printf "%s" "$line" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')"
+    cal="$(printf "%s" "$line" | sed -n 's/.*"calendar":"\([^"]*\)".*/\1/p')"
+    idx="$(printf "%s" "$line" | sed -n 's/.*"index":\([0-9][0-9]*\).*/\1/p')"
+    [[ -z "$cal" ]] && [[ -f "$P_MARK_DIR/${id}.json" ]] && cal="$(sed -n 's/.*"calendar":"\([^"]*\)".*/\1/p' "$P_MARK_DIR/${id}.json")"
+    [[ -z "$idx" ]] && [[ -f "$P_MARK_DIR/${id}.json" ]] && idx="$(sed -n 's/.*"index":\([0-9][0-9]*\).*/\1/p' "$P_MARK_DIR/${id}.json")"
+    [[ -z "$cal" ]] && [[ -f "$MARK_LOCAL/${id}.json" ]] && cal="$(sed -n 's/.*"calendar":"\([^"]*\)".*/\1/p' "$MARK_LOCAL/${id}.json")"
+    [[ -z "$idx" ]] && [[ -f "$MARK_LOCAL/${id}.json" ]] && idx="$(sed -n 's/.*"index":\([0-9][0-9]*\).*/\1/p' "$MARK_LOCAL/${id}.json")"
+    [[ -z "$cal" ]] && cal="$CAL_NAME"
+    [[ -z "$idx" ]] && idx="$CAL_INDEX"
+    [[ -z "$url" ]] && url=""
+    printf "%-16s %-10s %-20s %s\n" "$id" "$idx" "$cal" "$url"
+  done <<< "$ids"
+  echo "────────────────────────────────────────────"
+  echo "Persistent tracker: $P_TRACK"
 }
 
-add_calendar() {
+add_calendar_url(){
   ensure_venv
   require_defaults_or_prompt
   load_config
-
   echo
   read -rp "Enter calendar source (URL): " SRC
-  read -rp "Enter a short ID for this calendar (e.g., lions-2025): " ID
-
-  TMP_ICS="/tmp/${ID}.ics"
-
-  log "Preparing ICS…"
-  log "Fetch & normalize: $SRC  ->  $TMP_ICS"
-  "$PY" "$ROOT_DIR/prepare_ics_for_import.py" "$SRC" "$ID" "$TMP_ICS"
-
-  log "Opening Outlook import for: $TMP_ICS"
-  open -a "Microsoft Outlook" "$TMP_ICS" || {
-    echo "⚠️  Could not open Outlook with the ICS; try double-clicking $TMP_ICS manually."
-  }
-
-  echo
-  echo "➡ In Outlook's import, choose: \"${CAL_NAME}\" (#${CAL_INDEX})."
-  echo "   (Change defaults via menu option: Set Default Target Calendar)"
-
-  echo "{\"id\":\"$ID\",\"url\":\"$SRC\",\"calendar\":\"$CAL_NAME\",\"index\":${CAL_INDEX}}" >> "$TRACK"
-  echo "{\"id\":\"$ID\",\"url\":\"$SRC\",\"calendar\":\"$CAL_NAME\",\"index\":${CAL_INDEX}}" > "$MARK_DIR/${ID}.json"
-
-  log "Done. Imported '$ID' (pending your confirmation in Outlook)."
+  read -rp "Enter a short ID (e.g., lions): " ID
+  TMP="/tmp/${ID}.ics"
+  log "Fetch & normalize: $SRC -> $TMP"
+  "$PY" "$ROOT_DIR/prepare_ics_for_import.py" "$SRC" "$ID" "$TMP"
+  log "Opening Outlook import…"
+  open -a "Microsoft Outlook" "$TMP" || echo "⚠️  If Outlook didn't open, double-click $TMP"
+  echo "➡ In Outlook, choose: \"${CAL_NAME}\" (#${CAL_INDEX})."
+  upsert_track "$ID" "$SRC" "$CAL_NAME" "$CAL_INDEX"
   read -rp "Press Enter to continue…" _
 }
 
-remove_calendar() {
+import_local_file() {
   ensure_venv
   require_defaults_or_prompt
   load_config
-
-  echo "════════ Remove Calendar Events ════════"
-  list_sources
   echo
-  echo "Options:"
-  echo "  a) Remove by choosing a tracked entry"
-  echo "  b) Remove by entering an SRC ID manually (even if not tracked)"
-  read -rp "Choose [a/b] (default a): " MODE
-  MODE="${MODE:-a}"
-
-  if [[ "$MODE" == "a" && ! -s "$TRACK" ]]; then
-    echo "(No file-tracked entries. Switching to manual SRC ID.)"
-    MODE="b"
+  read -rp "Enter FULL path to .ics file: " FP
+  # Resolve the absolute path safely
+  ABS="$("$PY" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$FP")"
+  if [[ ! -f "$ABS" ]]; then
+    echo "❌ File not found: $ABS"; read -rp "Press Enter…" _; return
   fi
-
-  local ID CAL IDX
-  if [[ "$MODE" == "a" ]]; then
-    read -rp "Enter number to remove (or 'q' to cancel): " N
-    [[ "$N" =~ ^[0-9]+$ ]] || { echo "Cancelled."; sleep 1; return; }
-    LINE="$(sed -n "${N}p" "$TRACK" || true)"
-    if [[ -z "$LINE" ]]; then echo "No such entry."; sleep 1; return; fi
-
-    ID="$(echo "$LINE" | sed -E 's/.*\"id\":\"([^\"]+)\".*/\1/')"
-    CAL="$(echo "$LINE" | sed -E 's/.*\"calendar\":\"([^\"]+)\".*/\1/')"
-    IDX="$(echo "$LINE" | sed -E 's/.*\"index\":([0-9]+).*/\1/')"
-
-    log "Deleting [SRC: $ID] from '$CAL' (#$IDX)…"
-    osascript "$ROOT_DIR/outlook_delete_by_src.applescript" "$ID" "$CAL" "$IDX" \
-      && log "Deleted events tagged [SRC: $ID]" \
-      || echo "⚠️  Delete script reported an error."
-
-    tmpf="$(mktemp)"; awk -v n="$N" 'NR!=n' "$TRACK" > "$tmpf" && mv "$tmpf" "$TRACK"
-    rm -f "$MARK_DIR/${ID}.json"
-    read -rp "Press Enter to continue…" _
-  else
-    read -rp "Enter SRC ID to remove (e.g., lions): " ID
-    if [[ -f "$MARK_DIR/${ID}.json" ]]; then
-      CAL="$(sed -E 's/.*\"calendar\":\"([^\"]+)\".*/\1/;t;d' "$MARK_DIR/${ID}.json" || true)"
-      IDX="$(sed -E 's/.*\"index\":([0-9]+).*/\1/;t;d' "$MARK_DIR/${ID}.json" || true)"
-      CAL="${CAL:-$CAL_NAME}"
-      IDX="${IDX:-$CAL_INDEX}"
-    else
-      CAL="$CAL_NAME"
-      IDX="$CAL_INDEX"
-    fi
-    log "Deleting [SRC: $ID] from '$CAL' (#$IDX)…"
-    osascript "$ROOT_DIR/outlook_delete_by_src.applescript" "$ID" "$CAL" "$IDX" \
-      && log "Deleted events tagged [SRC: $ID]" \
-      || echo "⚠️  Delete script reported an error."
-
-    tmpf="$(mktemp)"; grep -v "\"id\":\"$ID\"" "$TRACK" > "$tmpf" || true; mv "$tmpf" "$TRACK"
-    rm -f "$MARK_DIR/${ID}.json"
-    read -rp "Press Enter to continue…" _
-  fi
+  read -rp "Enter a short ID (e.g., msu25): " ID
+  TMP="/tmp/${ID}.ics"
+  SRC="file://${ABS}"
+  log "Normalize local: $ABS -> $TMP"
+  "$PY" "$ROOT_DIR/prepare_ics_for_import.py" "$SRC" "$ID" "$TMP"
+  log "Opening Outlook import…"
+  open -a "Microsoft Outlook" "$TMP" || echo "⚠️  If Outlook didn't open, double-click $TMP"
+  echo "➡ In Outlook, choose: \"${CAL_NAME}\" (#${CAL_INDEX})."
+  upsert_track "$ID" "$SRC" "$CAL_NAME" "$CAL_INDEX"
+  read -rp "Press Enter to continue…" _
 }
 
-menu() {
-  cat <<MENU
+remove_calendar(){
+  ensure_venv
+  require_defaults_or_prompt
+  load_config
+  echo "Enter the SRC ID to remove (e.g., lions). Known IDs:"
+  get_all_ids | nl -ba
+  read -rp "ID or number: " choice
+  if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    choice="$(get_all_ids | sed -n "${choice}p")"
+  fi
+  ID="$choice"
+  [[ -z "$ID" ]] && { echo "Cancelled."; return; }
+
+  # Find calendar/index to target
+  line="$(grep "\"id\":\"$ID\"" "$P_TRACK" | tail -1)"
+  [[ -z "$line" ]] && line="$(grep "\"id\":\"$ID\"" "$TRACK_LOCAL" | tail -1)"
+  CAL="$(printf "%s" "$line" | sed -n 's/.*"calendar":"\([^"]*\)".*/\1/p')"
+  IDX="$(printf "%s" "$line" | sed -n 's/.*"index":\([0-9][0-9]*\).*/\1/p')"
+  [[ -z "$CAL" ]] && CAL="$CAL_NAME"
+  [[ -z "$IDX" ]] && IDX="$CAL_INDEX"
+
+  log "Deleting [SRC: $ID] from \"$CAL\" (#$IDX)…"
+  osascript "$ROOT_DIR/outlook_delete_by_src.applescript" "$ID" "$CAL" "$IDX" \
+    && log "Deleted." || echo "⚠️  Delete script reported an error."
+  delete_track "$ID"
+  read -rp "Press Enter to continue…" _
+}
+
+rebuild_tracking(){
+  ensure_venv
+  require_defaults_or_prompt
+  load_config
+  echo "Scanning \"$CAL_NAME\" (#$CAL_INDEX) for [SRC: …] tags…"
+  json="$(osascript "$ROOT_DIR/outlook_scan_srcs.applescript" "$CAL_NAME" "$CAL_INDEX" || true)"
+  echo "$json" | grep -q '"sources"' || { echo "⚠️  No data returned."; read -rp "Enter…" _; return; }
+
+  # Parse JSON via Python (command substitution), then loop safely.
+  ids_and_counts="$(
+    printf "%s" "$json" | "$PY" - <<'PY'
+import sys, json
+txt=sys.stdin.read()
+try:
+  data=json.loads(txt)
+  for s in data.get("sources", []):
+    i=s.get("id")
+    c=s.get("count",0)
+    if i:
+      print(f"{i}\t{c}")
+except Exception:
+  pass
+PY
+  )"
+
+  while IFS=$'\t' read -r ID CNT; do
+    [[ -z "${ID:-}" ]] && continue
+    upsert_track "$ID" "" "$CAL_NAME" "$CAL_INDEX"
+    echo "  • Rebuilt: $ID (events: $CNT)"
+  done <<< "$ids_and_counts"
+
+  echo "✅ Rebuild complete. (Persistent file: ${P_TRACK})"
+  read -rp "Press Enter to continue…" _
+}
+
+menu(){
+cat <<MENU
 ╔═════════ ICS Bridge for Outlook ═════════╗
-║ 1) ➕ Add Calendar via Outlook Import    ║
-║ 2) 🗑️  Remove Imported Calendar         ║
-║ 3) 📋 List Imported Calendars           ║
-║ 4) 🛠️  Set Default Target Calendar      ║
-║ 5) ❌ Quit                               ║
+║ 1) ➕ Add Calendar via URL               ║
+║ 2) 📁 Import from Local .ics File        ║
+║ 3) 🗑️  Remove Imported Calendar          ║
+║ 4) 📋 List Imported Calendars            ║
+║ 5) 🔁 Rebuild Tracking (this calendar)   ║
+║ 6) 🛠️  Set Default Target Calendar       ║
+║ 7) ❌ Quit                                ║
 ╚══════════════════════════════════════════╝
 MENU
-  read -rp "Choose [1-5]: " CHOICE
+  read -rp "Choose [1-7]: " CHOICE
 }
 
-main() {
+main(){
   while true; do
     menu
     case "${CHOICE:-}" in
-      1) add_calendar ;;
-      2) remove_calendar ;;
-      3) list_sources; read -rp "Press Enter to continue…" _ ;;
-      4) set_defaults ;;
-      5) exit 0 ;;
+      1) add_calendar_url ;;
+      2) import_local_file ;;
+      3) remove_calendar ;;
+      4) list_sources; read -rp "Press Enter to continue…" _ ;;
+      5) rebuild_tracking ;;
+      6) set_defaults ;;
+      7) exit 0 ;;
       *) echo "Invalid choice"; sleep 1 ;;
     esac
   done
